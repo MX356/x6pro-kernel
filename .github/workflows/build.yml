@@ -1,0 +1,137 @@
+# ============================================================
+# X6Pro (OPPO Find X6 Pro / SM8550 kalama) 自编译内核
+# 目标：KernelSU + SUSFS 隐藏 Root，过春秋 Native check / Momo
+# 云编译：GitHub Actions
+# 放置路径：仓库根目录 .github/workflows/build.yml
+# ============================================================
+name: Build X6Pro Kernel (KSU+SUSFS)
+
+on:
+  workflow_dispatch:      # 手动触发
+    inputs:
+      ksu_ref:
+        description: 'KernelSU ref'
+        default: 'v1.0.0'
+      susfs_ref:
+        description: 'SUSFS branch'
+        default: 'gki-android13-5.15'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: 环境准备
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential flex libssl-dev \
+            libelf-dev zip unzip cpio rsync python3 git curl wget lz4
+
+      - name: 磁盘信息
+        run: df -h
+
+      # ---------- 1. 拉取 OPPO 厂商树（命名成 msm-kernel/ 目录）----------
+      - name: Clone OPPO 厂商树 -> msm-kernel/
+        run: |
+          git clone --depth=1 \
+            -b oppo/sm8550_b_16.0.0_find_x6_pro \
+            https://github.com/oppo-source/android_kernel_oppo_sm8550.git \
+            msm-kernel
+          echo "OPPO commit: $(git -C msm-kernel rev-parse HEAD)"
+
+      # ---------- 2. 拉取 GKI 核心树 ----------
+      - name: Clone GKI -> common/
+        run: |
+          git clone --depth=1 -b android13-5.15 \
+            https://android.googlesource.com/kernel/common \
+            common
+          echo "GKI commit: $(git -C common rev-parse HEAD)"
+
+      # ---------- 3. 拉取 KernelSU + SUSFS ----------
+      - name: Clone KernelSU
+        run: |
+          git clone --depth=1 -b ${{ github.event.inputs.ksu_ref }} \
+            https://github.com/tiann/KernelSU.git KernelSU
+
+      - name: Clone SUSFS
+        run: |
+          git clone --depth=1 -b ${{ github.event.inputs.susfs_ref }} \
+            https://github.com/ShirkNeko/susfs4ksu.git SUSFS
+
+      # ---------- 4. 打 SUSFS 补丁到 GKI ----------
+      - name: Apply SUSFS patch
+        run: |
+          cd common
+          cp ../SUSFS/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch .
+          patch -p1 --forward < 50_add_susfs_in_gki-android13-5.15.patch \
+            || (echo "尝试 git apply"; git apply -p1 50_add_susfs_in_gki-android13-5.15.patch)
+          echo "SUSFS 补丁完成"
+
+      # ---------- 5. 集成 KernelSU ----------
+      - name: Integrate KernelSU
+        run: |
+          cd common
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "${{ github.event.inputs.ksu_ref }}"
+          echo "KernelSU 集成完成"
+
+      # ---------- 6. 启用 SUSFS for KSU ----------
+      - name: Enable SUSFS for KSU
+        run: |
+          cd common
+          if [ -f ../SUSFS/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ]; then
+            patch -p1 --forward < ../SUSFS/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch \
+              || (echo "尝试 git apply"; git apply -p1 ../SUSFS/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch)
+          fi
+
+      # ---------- 7. 下载 Clang 工具链 ----------
+      - name: Setup Clang (AOSP)
+        run: |
+          mkdir -p $HOME/toolchain
+          cd $HOME/toolchain
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r510928.tar.gz -O clang.tar.gz \
+            || wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz -O clang.tar.gz
+          mkdir clang && tar -xzf clang.tar.gz -C clang
+          echo "CLANG_PATH=$HOME/toolchain/clang" >> $GITHUB_ENV
+
+      # ---------- 8. 编译 ----------
+      - name: Build kernel
+        run: |
+          export PATH=$CLANG_PATH/bin:$PATH
+          export ARCH=arm64
+          export SUBARCH=arm64
+          cd msm-kernel
+          # 使用 OPPO 的 kalama.le 配置
+          BUILD_CONFIG=build.config.msm.kalama.le
+          echo "开始编译: $BUILD_CONFIG"
+          # OPPO 构建脚本入口
+          if [ -f build/build.sh ]; then
+            BUILD_CONFIG=$BUILD_CONFIG ./build/build.sh
+          else
+            # 退化方案：make 直编
+            make -j$(nproc) O=out ARCH=arm64 \
+              CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
+              OBJDUMP=llvm-objdump STRIP=llvm-strip \
+              LLVM=1 LLVM_IAS=1 \
+              kalama_le_defconfig
+            make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1
+          fi
+
+      # ---------- 9. 收集产物 ----------
+      - name: Collect artifacts
+        if: always()
+        run: |
+          mkdir -p out_artifacts
+          find msm-kernel -name "Image*" -o -name "*.dtb" -o -name "boot.img" 2>/dev/null | head -50
+          find msm-kernel/out -name "Image.lz4-dtb" -exec cp {} out_artifacts/ \; 2>/dev/null
+          find msm-kernel/out -name "Image.lz4" -exec cp {} out_artifacts/ \; 2>/dev/null
+          find msm-kernel/out -name "Image" -exec cp {} out_artifacts/ \; 2>/dev/null
+          find msm-kernel/out -name "boot.img" -exec cp {} out_artifacts/ \; 2>/dev/null
+          ls -la out_artifacts/
+
+      - name: Upload boot image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x6pro-kernel-${{ github.run_number }}
+          path: out_artifacts/
+          if-no-files-found: warn
